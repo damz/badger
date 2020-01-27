@@ -514,6 +514,11 @@ func (vlog *valueLog) rewrite(f *logFile, tr trace.Trace) error {
 			tr.LazyPrintf("Processing entry %d", count)
 		}
 
+		if e.meta&bitValuePointer == 0 {
+			// Not a pointer to the value log, avoid going to the LSM Tree.
+			return nil
+		}
+
 		vs, err := vlog.db.get(e.Key)
 		if err != nil {
 			return err
@@ -1412,6 +1417,11 @@ func (vlog *valueLog) write(reqs []*request) error {
 				b.Ptrs = append(b.Ptrs, valuePointer{})
 				continue
 			}
+
+			if !vlog.db.shouldWriteValueToLSM(*e) {
+				e.meta |= bitValuePointer
+			}
+
 			var p valuePointer
 
 			p.Fid = curlf.fid
@@ -1678,6 +1688,12 @@ func (vlog *valueLog) doRunGC(lf *logFile, discardRatio float64, tr trace.Trace)
 		}
 		r.total += esz
 		r.count++
+
+		if e.meta&bitValuePointer == 0 {
+			// Not a pointer to the value log, avoid going to the LSM Tree.
+			r.discard += esz
+			return nil
+		}
 
 		vs, err := vlog.db.get(e.Key)
 		if err != nil {
