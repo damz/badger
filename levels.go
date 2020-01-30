@@ -503,6 +503,10 @@ func (s *levelsController) compactBuildTables(
 	it := table.NewMergeIterator(iters, false)
 	defer it.Close() // Important to close the iterator to do ref counting.
 
+	if s.kv.opt.MergerFactory != nil {
+		it = newMergerIterator(s.kv, it)
+	}
+
 	it.Rewind()
 
 	// Pick a discard ts, so we can discard versions below this ts. We should

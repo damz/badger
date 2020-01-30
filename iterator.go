@@ -467,9 +467,16 @@ func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 	}
 	iters = txn.db.lc.appendIterators(iters, &opt) // This will increment references.
 
+	iitr := table.NewMergeIterator(iters, opt.Reverse)
+
+	if txn.db.opt.MergerFactory != nil {
+		// Process the merge operator.
+		iitr = newMergerIterator(txn.db, iitr)
+	}
+
 	res := &Iterator{
 		txn:    txn,
-		iitr:   table.NewMergeIterator(iters, opt.Reverse),
+		iitr:   iitr,
 		opt:    opt,
 		readTs: txn.readTs,
 	}

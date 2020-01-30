@@ -206,3 +206,8 @@ func (e *Entry) withMergeBit() *Entry {
 	e.meta = bitMergeEntry
 	return e
 }
+
+func (e *Entry) WithMergeBit() *Entry {
+	e.meta |= bitMergeEntry
+	return e
+}

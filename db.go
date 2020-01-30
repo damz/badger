@@ -423,11 +423,6 @@ func (db *DB) close() (err error) {
 
 	db.closers.pub.SignalAndWait()
 
-	// Now close the value log.
-	if vlogErr := db.vlog.Close(); vlogErr != nil {
-		err = errors.Wrap(vlogErr, "DB.Close")
-	}
-
 	// Make sure that block writer is done pushing stuff into memtable!
 	// Otherwise, you will have a race condition: we are trying to flush memtables
 	// and remove them completely, while the block / memtable writer is still
@@ -484,6 +479,11 @@ func (db *DB) close() (err error) {
 	db.closers.updateSize.SignalAndWait()
 	db.orc.Stop()
 	db.blockCache.Close()
+
+	// Now close the value log.
+	if vlogErr := db.vlog.Close(); vlogErr != nil {
+		err = errors.Wrap(vlogErr, "DB.Close")
+	}
 
 	db.elog.Finish()
 	if db.opt.InMemory {

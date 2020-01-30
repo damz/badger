@@ -332,9 +332,21 @@ func (txn *Txn) modify(e *Entry) error {
 	if err := txn.checkSize(e); err != nil {
 		return err
 	}
+
+	key := string(e.Key)
+	if e.meta&bitMergeEntry != 0 {
+		if existingE, ok := txn.pendingWrites[key]; ok && txn.db.opt.MergerFactory != nil {
+			merger := txn.db.opt.MergerFactory(existingE.Key)
+			merger.Merge(existingE.Value)
+			merger.Merge(e.Value)
+			existingE.Value = merger.Finalize()
+			return nil
+		}
+	}
+
+	txn.pendingWrites[key] = e
 	fp := z.MemHash(e.Key) // Avoid dealing with byte arrays.
 	txn.writes = append(txn.writes, fp)
-	txn.pendingWrites[string(e.Key)] = e
 	return nil
 }
 

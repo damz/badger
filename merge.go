@@ -148,7 +148,7 @@ func (op *MergeOperator) runCompactions(dur time.Duration) {
 // routine into the values that were recorded by previous invocations to Add().
 func (op *MergeOperator) Add(val []byte) error {
 	return op.db.Update(func(txn *Txn) error {
-		return txn.SetEntry(NewEntry(op.key, val).withMergeBit())
+		return txn.SetEntry(NewEntry(op.key, val).WithMergeBit())
 	})
 }
 
@@ -174,4 +174,104 @@ func (op *MergeOperator) Get() ([]byte, error) {
 // goroutine.
 func (op *MergeOperator) Stop() {
 	op.closer.SignalAndWait()
+}
+
+type Merger interface {
+	Merge(value []byte)
+	Finalize() []byte
+}
+
+type mergerIterator struct {
+	db      *DB
+	iter    y.Iterator
+	mergerF func(key []byte) Merger
+
+	valid  bool
+	merger Merger
+	key    []byte
+	value  y.ValueStruct
+}
+
+func newMergerIterator(db *DB, iter y.Iterator) *mergerIterator {
+	return &mergerIterator{
+		db:      db,
+		iter:    iter,
+		mergerF: db.opt.MergerFactory,
+	}
+}
+
+func (i *mergerIterator) feed() {
+	i.valid = i.iter.Valid()
+	if !i.valid {
+		return
+	}
+	i.key = append(i.key[:0], i.iter.Key()...)
+	i.value = i.iter.Value()
+
+	if i.value.Meta&bitMergeEntry == 0 {
+		i.iter.Next()
+		return
+	}
+
+	item := Item{
+		db: i.db,
+	}
+	first := true
+	for {
+		item.key = i.iter.Key()
+		vs := i.iter.Value()
+		item.meta = vs.Meta
+		item.vptr = vs.Value
+
+		buf, cb, err := (&item).yieldItemValue()
+		if err != nil {
+			runCallback(cb)
+			panic(err) // TODO
+		}
+
+		if first {
+			i.merger = i.mergerF(y.ParseKey(i.key))
+			first = false
+		}
+		i.merger.Merge(buf)
+		runCallback(cb)
+
+		i.iter.Next()
+		if !i.iter.Valid() || !y.SameKey(i.iter.Key(), i.key) {
+			break
+		}
+	}
+
+	i.value.Meta &^= bitValuePointer
+	i.value.Value = i.merger.Finalize()
+}
+
+func (i *mergerIterator) Next() {
+	i.feed()
+}
+
+func (i *mergerIterator) Rewind() {
+	i.iter.Rewind()
+	i.feed()
+}
+
+func (i *mergerIterator) Seek(key []byte) {
+	i.iter.Seek(key)
+	i.feed()
+}
+
+func (i *mergerIterator) Key() []byte {
+	return i.key
+}
+
+func (i *mergerIterator) Value() y.ValueStruct {
+	return i.value
+}
+
+func (i *mergerIterator) Valid() bool {
+	return i.valid
+}
+
+func (i *mergerIterator) Close() error {
+	return i.iter.Close()
 }
