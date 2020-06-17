@@ -19,7 +19,6 @@ package badger
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
 	"os"
 	"sort"
 	"strings"
@@ -337,46 +336,61 @@ func (s *levelsController) dropPrefix(prefix []byte) error {
 }
 
 func (s *levelsController) startCompact(lc *y.Closer) {
-	n := s.kv.opt.NumCompactors
-	lc.AddRunning(n - 1)
-	for i := 0; i < n; i++ {
-		go s.runWorker(lc)
-	}
+	go s.runWorker(lc)
 }
 
 func (s *levelsController) runWorker(lc *y.Closer) {
 	defer lc.Done()
 
-	randomDelay := time.NewTimer(time.Duration(rand.Int31n(1000)) * time.Millisecond)
-	select {
-	case <-randomDelay.C:
-	case <-lc.HasBeenClosed():
-		randomDelay.Stop()
-		return
+	var wg sync.WaitGroup
+
+	semCh := make(chan struct{}, s.kv.opt.NumCompactors)
+	cdCh := make(chan compactDef)
+
+	for i := 0; i < s.kv.opt.NumCompactors; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for cd := range cdCh {
+				err := s.runCompact(cd)
+				if err != nil {
+					s.kv.opt.Warningf("While running compaction: %v\n", err)
+				}
+				<-semCh
+			}
+		}()
 	}
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	defer func() {
+		close(cdCh)
+		wg.Wait()
+	}()
 
+compactionLoop:
 	for {
 		select {
-		// Can add a done channel or other stuff.
-		case <-ticker.C:
-			prios := s.pickCompactLevels()
-		loop:
-			for _, p := range prios {
-				err := s.doCompact(p)
-				switch err {
-				case nil:
-					break loop
-				case errFillTables:
-					// pass
-				default:
-					s.kv.opt.Warningf("While running doCompact: %v\n", err)
-				}
-			}
 		case <-lc.HasBeenClosed():
-			return
+			break compactionLoop
+		case semCh <- struct{}{}:
+			prios := s.pickCompactLevels()
+			for _, p := range prios {
+				cd, err := s.prepareCompact(p)
+				if err == errFillTables {
+					// Try to schedule the next level
+					continue
+				}
+
+				cdCh <- cd
+				continue compactionLoop
+			}
+
+			// Nothing to do, return the item we borrowed.
+			<-semCh
+
+			// Now wait a bit.
+			// TODO: this could be replaced by a "there is a new table at L0" event
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -906,6 +920,15 @@ var errFillTables = errors.New("Unable to fill tables")
 
 // doCompact picks some table on level l and compacts it away to the next level.
 func (s *levelsController) doCompact(p compactionPriority) error {
+	cd, err := s.prepareCompact(p)
+	if err != nil {
+		return err
+	}
+
+	return s.runCompact(cd)
+}
+
+func (s *levelsController) prepareCompact(p compactionPriority) (compactDef, error) {
 	l := p.level
 	y.AssertTrue(l+1 < s.kv.opt.MaxLevels) // Sanity check.
 
@@ -916,29 +939,36 @@ func (s *levelsController) doCompact(p compactionPriority) error {
 		dropPrefix: p.dropPrefix,
 	}
 	cd.elog.SetMaxEvents(100)
-	defer cd.elog.Finish()
 
-	s.kv.opt.Infof("Got compaction priority: %+v", p)
+	s.kv.opt.Debugf("Got compaction priority: %+v", p)
 
 	// While picking tables to be compacted, both levels' tables are expected to
 	// remain unchanged.
 	if l == 0 {
 		if !s.fillTablesL0(&cd) {
-			return errFillTables
+			cd.elog.Finish()
+			return cd, errFillTables
 		}
 
 	} else {
 		if !s.fillTables(&cd) {
-			return errFillTables
+			cd.elog.Finish()
+			return cd, errFillTables
 		}
 	}
+
+	return cd, nil
+}
+
+func (s *levelsController) runCompact(cd compactDef) error {
+	defer cd.elog.Finish()
 	defer s.cstatus.delete(cd) // Remove the ranges from compaction status.
 
-	s.kv.opt.Infof("Running for level: %d\n", cd.thisLevel.level)
+	s.kv.opt.Infof("Running compaction %d->%d\n", cd.thisLevel.level, cd.nextLevel.level)
 	s.cstatus.toLog(cd.elog)
-	if err := s.runCompactDef(l, cd); err != nil {
+	if err := s.runCompactDef(cd.thisLevel.level, cd); err != nil {
 		// This compaction couldn't be done successfully.
-		s.kv.opt.Warningf("LOG Compact FAILED with error: %+v: %+v", err, cd)
+		s.kv.opt.Warningf("Compact FAILED with error: %+v: %+v", err, cd)
 		return err
 	}
 
